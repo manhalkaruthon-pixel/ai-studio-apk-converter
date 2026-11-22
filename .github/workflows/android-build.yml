@@ -86,6 +86,24 @@ jobs:
           mkdir project
           unzip -q source.zip -d project
 
+      - name: Generate debug keystore
+        run: |
+          set -euo pipefail
+          if [ ! -f "$GITHUB_WORKSPACE/project/debug.keystore" ]; then
+            echo "Generating missing debug keystore..."
+            keytool -genkeypair -v \
+              -keystore "$GITHUB_WORKSPACE/project/debug.keystore" \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          else
+            echo "Debug keystore already exists."
+          fi
+
       - name: Build APK
         run: |
           set -euo pipefail
