@@ -5,7 +5,6 @@ import unzipper from 'unzipper';
 import fs from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -28,12 +27,11 @@ const upload = multer({
   limits: { fileSize: MAX_UPLOAD, files: 1 },
   fileFilter: (_req, file, cb) => {
     const ok = file.originalname.toLowerCase().endsWith('.zip') &&
-      (file.mimetype === 'application/zip' || file.mimetype === 'application/x-zip-compressed' || file.mimetype === 'application/octet-stream');
+      ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'].includes(file.mimetype);
     cb(ok ? null : new Error('Upload a .zip archive.'), ok);
   }
 });
 
-// Validate every API request against Supabase Auth. Never trust client-supplied user IDs.
 async function requireUser(req, res, next) {
   const match = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
   if (!match) return res.status(401).json({ error: 'Sign in to continue.' });
@@ -60,7 +58,9 @@ async function supabaseRequest(endpoint, accessToken, options = {}) {
   const raw = await response.text();
   let data = null;
   try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
-  if (!response.ok) throw new Error(data?.message || data?.error || data?.msg || `Supabase request failed (${response.status}).`);
+  if (!response.ok) {
+    throw new Error(data?.message || data?.error || data?.msg || `Supabase request failed (${response.status}).`);
+  }
   return data;
 }
 
@@ -70,15 +70,20 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 function run(command, args, cwd, timeout = BUILD_TIMEOUT) {
   return new Promise((resolve, reject) => {
-    const buildEnv = { ...process.env, CI: '1', ANDROID_HOME: process.env.ANDROID_HOME || '/opt/android-sdk', ANDROID_SDK_ROOT: process.env.ANDROID_SDK_ROOT || '/opt/android-sdk' };
-    // Never expose the web application's authentication secret to untrusted project install/build scripts.
+    const buildEnv = {
+      ...process.env,
+      CI: '1',
+      ANDROID_HOME: process.env.ANDROID_HOME || '/opt/android-sdk',
+      ANDROID_SDK_ROOT: process.env.ANDROID_SDK_ROOT || '/opt/android-sdk'
+    };
     delete buildEnv.APP_PASSWORD;
     delete buildEnv.SUPABASE_URL;
     delete buildEnv.SUPABASE_PUBLISHABLE_KEY;
+
     const child = spawn(command, args, { cwd, env: buildEnv, stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
     child.stderr.on('data', d => { stderr = (stderr + d.toString()).slice(-12000); });
-    child.stdout.on('data', d => { /* Keep build output out of the UI and logs. */ });
+    child.stdout.on('data', () => {});
     const timer = setTimeout(() => child.kill('SIGKILL'), timeout);
     child.on('error', err => { clearTimeout(timer); reject(err); });
     child.on('close', code => {
@@ -96,28 +101,38 @@ async function extractSafe(zipPath, destination) {
   if (directory.files.length > 5000) throw new Error('Archive contains too many files.');
   for (const entry of directory.files) {
     const raw = entry.path.replaceAll('\\', '/');
-    if (raw.startsWith('/') || /^[A-Za-z]:/.test(raw) || raw.split('/').some(p => p === '..')) throw new Error('Unsafe path in ZIP archive.');
+    if (raw.startsWith('/') || /^[A-Za-z]:/.test(raw) || raw.split('/').some(p => p === '..')) {
+      throw new Error('Unsafe path in ZIP archive.');
+    }
     if (entry.type === 'SymbolicLink') throw new Error('Symbolic links are not allowed in ZIP archives.');
     total += entry.uncompressedSize || 0;
     if (total > 500 * 1024 * 1024) throw new Error('Uncompressed archive exceeds 500 MB.');
     const target = path.resolve(destination, raw);
-    if (!target.startsWith(path.resolve(destination) + path.sep) && target !== path.resolve(destination)) throw new Error('Unsafe archive path.');
-    if (entry.type === 'Directory') await fs.mkdir(target, { recursive: true });
-    else {
+    if (!target.startsWith(path.resolve(destination) + path.sep) && target !== path.resolve(destination)) {
+      throw new Error('Unsafe archive path.');
+    }
+    if (entry.type === 'Directory') {
+      await fs.mkdir(target, { recursive: true });
+    } else {
       await fs.mkdir(path.dirname(target), { recursive: true });
-      await new Promise((resolve, reject) => entry.stream().pipe(createWriteStream(target, { mode: 0o644 })).on('finish', resolve).on('error', reject));
+      await new Promise((resolve, reject) => {
+        entry.stream()
+          .pipe(createWriteStream(target, { mode: 0o644 }))
+          .on('finish', resolve)
+          .on('error', reject);
+      });
     }
   }
 }
 
 async function findProjectRoot(dir) {
   const entries = await fs.readdir(dir, { withFileTypes: true });
-  if (entries.some(e => e.isFile() && e.name === 'package.json') || entries.some(e => e.isFile() && e.name.toLowerCase() === 'index.html')) return dir;
+  if (entries.some(e => e.isFile() && e.name === 'package.json') ||
+      entries.some(e => e.isFile() && e.name.toLowerCase() === 'index.html')) return dir;
   const dirs = entries.filter(e => e.isDirectory() && !['node_modules', '__MACOSX'].includes(e.name));
   if (dirs.length === 1) return findProjectRoot(path.join(dir, dirs[0].name));
   for (const d of dirs) {
-    const candidate = path.join(dir, d.name);
-    try { return await findProjectRoot(candidate); } catch {}
+    try { return await findProjectRoot(path.join(dir, d.name)); } catch {}
   }
   throw new Error('Could not find a web project in this ZIP.');
 }
@@ -129,14 +144,22 @@ async function removeEnvFiles(root) {
       if (ent.isDirectory()) {
         if (ent.name === 'node_modules' || ent.name === '.git') continue;
         await walk(full);
-      } else if (ent.name === '.env' || ent.name.startsWith('.env.')) await fs.rm(full, { force: true });
+      } else if (ent.name === '.env' || ent.name.startsWith('.env.')) {
+        await fs.rm(full, { force: true });
+      }
     }
   }
   await walk(root);
 }
 
 function safeId(value) {
-  return String(value || 'app').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 48) || 'app';
+  return String(value || 'app')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '.')
+    .replace(/^\.+|\.+$/g, '')
+    .slice(0, 48) || 'app';
 }
 
 async function patchVite(root) {
@@ -144,24 +167,35 @@ async function patchVite(root) {
   for (const name of files) {
     const full = path.join(root, name);
     let source = await fs.readFile(full, 'utf8');
-    if (/\bbase\s*:/.test(source)) source = source.replace(/\bbase\s*:\s*(['"`])[^'"`]*\1/, "base: './'");
-    else source = source.replace(/defineConfig\s*\(\s*\{/, "defineConfig({ base: './',");
+    if (/\bbase\s*:/.test(source)) {
+      source = source.replace(/\bbase\s*:\s*(['"`])[^'"`]*\1/, "base: './'");
+    } else {
+      source = source.replace(/defineConfig\s*\(\s*\{/, "defineConfig({ base: './',");
+    }
     await fs.writeFile(full, source);
   }
 }
 
 app.post('/api/convert', requireUser, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Select a ZIP archive.' });
+
   const jobId = crypto.randomUUID();
   const userId = req.user.id;
   const objectPath = `${userId}/${jobId}/app.apk`;
   const work = await fs.mkdtemp(path.join('/var/tmp/apk-build', 'job-'));
   let jobCreated = false;
+
   try {
     await supabaseRequest('/rest/v1/conversion_jobs', req.accessToken, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify({ id: jobId, user_id: userId, original_filename: req.file.originalname, status: 'building', source_bytes: req.file.size })
+      body: JSON.stringify({
+        id: jobId,
+        user_id: userId,
+        original_filename: req.file.originalname,
+        status: 'building',
+        source_bytes: req.file.size
+      })
     });
     jobCreated = true;
 
@@ -176,8 +210,12 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
     const pkgPath = path.join(root, 'package.json');
     let pkg = null;
     try { pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8')); } catch {}
-    const appName = String(pkg?.name || path.basename(root)).replace(/[-_.]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).slice(0, 40) || 'Converted App';
+    const appName = String(pkg?.name || path.basename(root))
+      .replace(/[-_.]+/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase())
+      .slice(0, 40) || 'Converted App';
     const appId = `com.aistudio.converted.${safeId(pkg?.name || path.basename(root)).replaceAll('.', '')}`;
+
     let webDir;
     if (pkg) {
       await run('npm', ['install', '--no-audit', '--no-fund'], root);
@@ -185,26 +223,39 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
       const candidates = ['dist', 'build', 'www'].map(n => path.join(root, n));
       webDir = null;
       for (const candidate of candidates) {
-        try { if ((await fs.stat(path.join(candidate, 'index.html'))).isFile()) { webDir = candidate; break; } } catch {}
+        try {
+          if ((await fs.stat(path.join(candidate, 'index.html'))).isFile()) {
+            webDir = candidate;
+            break;
+          }
+        } catch {}
       }
       if (!webDir) throw new Error('Build completed but no dist/, build/ or www/ index.html was produced.');
     } else {
-      const index = path.join(root, 'index.html');
-      try { await fs.access(index); } catch { throw new Error('ZIP must contain package.json or a root index.html.'); }
+      try { await fs.access(path.join(root, 'index.html')); }
+      catch { throw new Error('ZIP must contain package.json or a root index.html.'); }
       webDir = path.join(work, 'www');
-      await fs.cp(root, webDir, { recursive: true, filter: src => !src.split(path.sep).some(p => p === '.git' || p === 'node_modules') });
+      await fs.cp(root, webDir, {
+        recursive: true,
+        filter: src => !src.split(path.sep).some(p => p === '.git' || p === 'node_modules')
+      });
     }
 
     const native = path.join(work, 'native');
     await fs.mkdir(native, { recursive: true });
     await fs.cp(webDir, path.join(native, 'www'), { recursive: true });
-    await fs.writeFile(path.join(native, 'package.json'), JSON.stringify({ name: 'apk-wrapper', version: '1.0.0', private: true }, null, 2));
+    await fs.writeFile(path.join(native, 'package.json'), JSON.stringify({
+      name: 'apk-wrapper', version: '1.0.0', private: true
+    }, null, 2));
     await run('npm', ['init', '-y'], native);
     await run('npm', ['install', '--no-audit', '--no-fund', '@capacitor/core@^7', '@capacitor/cli@^7', '@capacitor/android@^7'], native);
-    await fs.writeFile(path.join(native, 'capacitor.config.json'), JSON.stringify({ appId, appName, webDir: 'www', bundledWebRuntime: false }, null, 2));
+    await fs.writeFile(path.join(native, 'capacitor.config.json'), JSON.stringify({
+      appId, appName, webDir: 'www', bundledWebRuntime: false
+    }, null, 2));
     await run('npx', ['cap', 'add', 'android'], native);
     await run('npx', ['cap', 'sync', 'android'], native);
     await run('./gradlew', ['assembleDebug', '--no-daemon'], path.join(native, 'android'), BUILD_TIMEOUT);
+
     const apk = path.join(native, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
     await fs.access(apk);
     const apkBuffer = await fs.readFile(apk);
@@ -214,40 +265,115 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
       headers: { 'Content-Type': 'application/vnd.android.package-archive', 'x-upsert': 'false' },
       body: apkBuffer
     });
-    await supabaseRequest(`/rest/v1/conversion_jobs?id=eq.${jobId}`, req.accessToken, {
+
+    await supabaseRequest(`/rest/v1/conversion_jobs?id=eq.${jobId}&user_id=eq.${userId}`, req.accessToken, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify({ status: 'completed', artifact_path: objectPath, artifact_bytes: apkBuffer.length, completed_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      body: JSON.stringify({
+        status: 'completed',
+        artifact_path: objectPath,
+        artifact_bytes: apkBuffer.length,
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
     });
+
     const signed = await supabaseRequest(`/storage/v1/object/sign/apk-artifacts/${objectPath}`, req.accessToken, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expiresIn: 3600 })
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expiresIn: 3600 })
     });
-    res.json({ jobId, appName, downloadUrl: `${SUPABASE_URL}/storage/v1${signed.signedURL}`, expiresIn: 3600 });
+
+    if (!res.headersSent) {
+      res.json({
+        jobId,
+        appName,
+        downloadUrl: `${SUPABASE_URL}/storage/v1${signed.signedURL}`,
+        expiresIn: 3600
+      });
+    }
   } catch (err) {
     console.error('Conversion failed:', err.message);
     if (jobCreated) {
       try {
-        await supabaseRequest(`/rest/v1/conversion_jobs?id=eq.${jobId}`, req.accessToken, {
-          method: 'PATCH', headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-          body: JSON.stringify({ status: 'failed', error_message: err.message.slice(0, 1000), updated_at: new Date().toISOString() })
+        await supabaseRequest(`/rest/v1/conversion_jobs?id=eq.${jobId}&user_id=eq.${userId}`, req.accessToken, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+          body: JSON.stringify({
+            status: 'failed',
+            error_message: err.message.slice(0, 1000),
+            updated_at: new Date().toISOString()
+          })
         });
-      } catch (dbErr) { console.error('Could not update failed job:', dbErr.message); }
+      } catch (dbErr) {
+        console.error('Could not update failed job:', dbErr.message);
+      }
     }
-    if (!res.headersSent) res.status(422).json({ error: err.message.slice(0, 1200) || 'Conversion failed.', jobId: jobCreated ? jobId : undefined });
+    if (!res.headersSent) {
+      res.status(422).json({
+        error: err.message.slice(0, 1200) || 'Conversion failed.',
+        jobId: jobCreated ? jobId : undefined
+      });
+    }
   } finally {
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
   }
 });
 
+// Create a fresh, private, one-hour download URL for a completed job owned by the signed-in user.
+app.get('/api/jobs/:id/download', requireUser, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid job ID.' });
+    }
+
+    const rows = await supabaseRequest(
+      `/rest/v1/conversion_jobs?select=id,status,artifact_path&id=eq.${encodeURIComponent(req.params.id)}&user_id=eq.${encodeURIComponent(req.user.id)}&limit=1`,
+      req.accessToken
+    );
+    const job = rows?.[0];
+
+    if (!job) return res.status(404).json({ error: 'Conversion not found.' });
+    if (job.status !== 'completed' || !job.artifact_path) {
+      return res.status(409).json({ error: 'APK is not ready yet.' });
+    }
+
+    const safePath = String(job.artifact_path).split('/').map(encodeURIComponent).join('/');
+    const signed = await supabaseRequest(
+      `/storage/v1/object/sign/apk-artifacts/${safePath}`,
+      req.accessToken,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expiresIn: 3600 })
+      }
+    );
+
+    res.json({
+      downloadUrl: `${SUPABASE_URL}/storage/v1${signed.signedURL}`,
+      expiresIn: 3600
+    });
+  } catch (err) {
+    console.error('Download link error:', err.message);
+    res.status(502).json({ error: 'Could not create the download link. Please try again.' });
+  }
+});
+
 app.get('/api/jobs', requireUser, async (req, res) => {
   try {
-    const rows = await supabaseRequest('/rest/v1/conversion_jobs?select=id,original_filename,status,error_message,artifact_bytes,created_at,completed_at&order=created_at.desc&limit=30', req.accessToken);
+    const rows = await supabaseRequest(
+      '/rest/v1/conversion_jobs?select=id,original_filename,status,error_message,artifact_bytes,created_at,completed_at&order=created_at.desc&limit=30',
+      req.accessToken
+    );
     res.json({ jobs: rows || [] });
-  } catch (err) { res.status(502).json({ error: err.message }); }
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
 
 app.use((err, _req, res, _next) => {
   const status = err instanceof multer.MulterError ? 413 : 400;
   res.status(status).json({ error: err.message || 'Request failed.' });
 });
+
 app.listen(PORT, '0.0.0.0', () => console.log(`APK converter listening on ${PORT}`));
