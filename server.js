@@ -323,6 +323,7 @@ async function findApk(dir) {
 }
 
 // Native Android build with reduced memory usage.
+
 async function buildNativeAndroid(root) {
   const keystore = path.join(root, 'debug.keystore');
 
@@ -348,7 +349,7 @@ async function buildNativeAndroid(root) {
     '--no-daemon',
     '--max-workers=1',
     '--no-configuration-cache',
-    '-Dorg.gradle.jvmargs=-Xmx320m -XX:MaxMetaspaceSize=160m -XX:ReservedCodeCacheSize=48m -XX:+UseSerialGC',
+    '-Dorg.gradle.jvmargs=-Xmx256m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=32m -XX:+UseSerialGC',
     '-Dorg.gradle.internal.instrumentation.agent=false',
     '-Dorg.gradle.parallel=false',
     '-Dorg.gradle.vfs.watch=false',
