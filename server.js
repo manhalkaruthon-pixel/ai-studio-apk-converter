@@ -304,12 +304,13 @@ async function buildNativeAndroid(root) {
   }
 
   // Use the Gradle version installed in the Docker image.
-  await run('gradle', [
-    'assembleDebug',
-    '--no-daemon',
-    '--max-workers=2',
-    '-Dorg.gradle.jvmargs=-Xmx2g'
-  ], root, BUILD_TIMEOUT);
+ await run('gradle', [
+  'assembleDebug',
+  '--no-daemon',
+  '--max-workers=1',
+  '-Dorg.gradle.jvmargs=-Xmx512m -XX:MaxMetaspaceSize=256m',
+  '-Pkotlin.compiler.execution.strategy=in-process'
+], root, BUILD_TIMEOUT);
 
   const apk = await findApk(path.join(root, 'app', 'build', 'outputs', 'apk'));
   if (!apk) {
