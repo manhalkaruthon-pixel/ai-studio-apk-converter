@@ -194,7 +194,6 @@ async function extractSafe(zipPath, destination) {
   }
 }
 
-// Detect native Android projects and web projects, including nested ZIP folders.
 async function findProject(dir, depth = 0) {
   if (depth > 6) return null;
 
@@ -232,7 +231,6 @@ async function findProject(dir, depth = 0) {
   return null;
 }
 
-// Remove environment files but preserve .env.example.
 async function removeEnvFiles(root) {
   async function walk(dir) {
     for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
@@ -324,8 +322,8 @@ async function findApk(dir) {
     null;
 }
 
+// Native Android build with reduced memory usage.
 async function buildNativeAndroid(root) {
-  // Generate the standard Android debug signing key if the project does not have one.
   const keystore = path.join(root, 'debug.keystore');
 
   try {
@@ -345,15 +343,17 @@ async function buildNativeAndroid(root) {
     ], root);
   }
 
-  // Use the Gradle version installed in the Docker image.
   await run('gradle', [
     'assembleDebug',
     '--no-daemon',
     '--max-workers=1',
     '--no-configuration-cache',
-    '-Dorg.gradle.jvmargs=-Xmx384m -XX:MaxMetaspaceSize=192m',
+    '-Dorg.gradle.jvmargs=-Xmx320m -XX:MaxMetaspaceSize=160m -XX:ReservedCodeCacheSize=48m -XX:+UseSerialGC',
     '-Dorg.gradle.internal.instrumentation.agent=false',
-    '-Pkotlin.compiler.execution.strategy=in-process'
+    '-Dorg.gradle.parallel=false',
+    '-Dorg.gradle.vfs.watch=false',
+    '-Pkotlin.compiler.execution.strategy=in-process',
+    '-Pkotlin.incremental=false'
   ], root, BUILD_TIMEOUT);
 
   const apk = await findApk(
@@ -510,11 +510,9 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
     jobCreated = true;
 
     const zipPath = path.join(work, 'source.zip');
-
     await fs.writeFile(zipPath, req.file.buffer, { mode: 0o600 });
 
     const extracted = path.join(work, 'extracted');
-
     await extractSafe(zipPath, extracted);
 
     const project = await findProject(extracted);
@@ -524,7 +522,6 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
     }
 
     const root = project.root;
-
     await removeEnvFiles(root);
 
     let apk;
@@ -628,7 +625,6 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
   }
 });
 
-// Create a fresh private download URL for a completed job owned by the signed-in user.
 app.get('/api/jobs/:id/download', requireUser, async (req, res) => {
   try {
     if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) {
