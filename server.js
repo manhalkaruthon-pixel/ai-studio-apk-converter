@@ -41,7 +41,10 @@ async function requireUser(req, res, next) {
     const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${match[1]}` }
     });
-    if (!response.ok) return res.status(401).json({ error: 'Your session has expired. Sign in again.' });
+
+    if (!response.ok) {
+      return res.status(401).json({ error: 'Your session has expired. Sign in again.' });
+    }
 
     const user = await response.json();
     if (!user?.id) return res.status(401).json({ error: 'Invalid user session.' });
@@ -66,11 +69,17 @@ async function supabaseRequest(endpoint, accessToken, options = {}) {
 
   const raw = await response.text();
   let data = null;
-  try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
+
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = raw;
+  }
 
   if (!response.ok) {
     throw new Error(data?.message || data?.error || data?.msg || `Supabase request failed (${response.status}).`);
   }
+
   return data;
 }
 
@@ -108,9 +117,11 @@ function run(command, args, cwd, timeout = BUILD_TIMEOUT) {
     });
 
     let stderr = '';
+
     child.stderr.on('data', d => {
       stderr = (stderr + d.toString()).slice(-12000);
     });
+
     child.stdout.on('data', () => {});
 
     const timer = setTimeout(() => child.kill('SIGKILL'), timeout);
@@ -122,6 +133,7 @@ function run(command, args, cwd, timeout = BUILD_TIMEOUT) {
 
     child.on('close', code => {
       clearTimeout(timer);
+
       if (code === 0) resolve();
       else reject(new Error(`${command} exited with code ${code}. ${stderr.slice(-3000)}`));
     });
@@ -140,8 +152,11 @@ async function extractSafe(zipPath, destination) {
   for (const entry of directory.files) {
     const raw = entry.path.replaceAll('\\', '/');
 
-    if (raw.startsWith('/') || /^[A-Za-z]:/.test(raw) ||
-        raw.split('/').some(p => p === '..')) {
+    if (
+      raw.startsWith('/') ||
+      /^[A-Za-z]:/.test(raw) ||
+      raw.split('/').some(p => p === '..')
+    ) {
       throw new Error('Unsafe path in ZIP archive.');
     }
 
@@ -150,13 +165,17 @@ async function extractSafe(zipPath, destination) {
     }
 
     total += entry.uncompressedSize || 0;
+
     if (total > 500 * 1024 * 1024) {
       throw new Error('Uncompressed archive exceeds 500 MB.');
     }
 
     const target = path.resolve(destination, raw);
-    if (!target.startsWith(path.resolve(destination) + path.sep) &&
-        target !== path.resolve(destination)) {
+
+    if (
+      !target.startsWith(path.resolve(destination) + path.sep) &&
+      target !== path.resolve(destination)
+    ) {
       throw new Error('Unsafe archive path.');
     }
 
@@ -164,6 +183,7 @@ async function extractSafe(zipPath, destination) {
       await fs.mkdir(target, { recursive: true });
     } else {
       await fs.mkdir(path.dirname(target), { recursive: true });
+
       await new Promise((resolve, reject) => {
         entry.stream()
           .pipe(createWriteStream(target, { mode: 0o644 }))
@@ -185,8 +205,10 @@ async function findProject(dir, depth = 0) {
     files.has('settings.gradle') || files.has('settings.gradle.kts');
 
   const hasAppGradle = await Promise.all([
-    fs.access(path.join(dir, 'app', 'build.gradle')).then(() => true).catch(() => false),
-    fs.access(path.join(dir, 'app', 'build.gradle.kts')).then(() => true).catch(() => false)
+    fs.access(path.join(dir, 'app', 'build.gradle'))
+      .then(() => true).catch(() => false),
+    fs.access(path.join(dir, 'app', 'build.gradle.kts'))
+      .then(() => true).catch(() => false)
   ]).then(results => results.some(Boolean));
 
   if (hasGradleSettings && hasAppGradle) {
@@ -210,6 +232,7 @@ async function findProject(dir, depth = 0) {
   return null;
 }
 
+// Remove environment files but preserve .env.example.
 async function removeEnvFiles(root) {
   async function walk(dir) {
     for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
@@ -218,17 +241,17 @@ async function removeEnvFiles(root) {
       if (ent.isDirectory()) {
         if (['node_modules', '.git'].includes(ent.name)) continue;
         await walk(full);
-      } else if (
-        ent.name === '.env' ||
-        (ent.name.startsWith('.env.') && ent.name !== '.env.example')
-      ) {
-        await fs.rm(full, { force: true });
+      } else {
+        const isEnvFile =
+          ent.name === '.env' ||
+          (ent.name.startsWith('.env.') && ent.name !== '.env.example');
+
+        if (isEnvFile) {
+          await fs.rm(full, { force: true });
+        }
       }
     }
   }
-
-  await walk(root);
-}
 
   await walk(root);
 }
@@ -253,9 +276,15 @@ async function patchVite(root) {
     let source = await fs.readFile(full, 'utf8');
 
     if (/\bbase\s*:/.test(source)) {
-      source = source.replace(/\bbase\s*:\s*(['"`])[^'"`]*\1/, "base: './'");
+      source = source.replace(
+        /\bbase\s*:\s*(['"`])[^'"`]*\1/,
+        "base: './'"
+      );
     } else {
-      source = source.replace(/defineConfig\s*\(\s*\{/, "defineConfig({ base: './',");
+      source = source.replace(
+        /defineConfig\s*\(\s*\{/,
+        "defineConfig({ base: './',"
+      );
     }
 
     await fs.writeFile(full, source);
@@ -267,6 +296,7 @@ async function findApk(dir) {
 
   async function walk(current) {
     let entries;
+
     try {
       entries = await fs.readdir(current, { withFileTypes: true });
     } catch {
@@ -278,14 +308,20 @@ async function findApk(dir) {
 
       if (entry.isDirectory()) {
         await walk(full);
-      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.apk')) {
+      } else if (
+        entry.isFile() &&
+        entry.name.toLowerCase().endsWith('.apk')
+      ) {
         matches.push(full);
       }
     }
   }
 
   await walk(dir);
-  return matches.find(p => p.endsWith('/debug/app-debug.apk')) || matches[0] || null;
+
+  return matches.find(p => p.endsWith('/debug/app-debug.apk')) ||
+    matches[0] ||
+    null;
 }
 
 async function buildNativeAndroid(root) {
@@ -310,17 +346,20 @@ async function buildNativeAndroid(root) {
   }
 
   // Use the Gradle version installed in the Docker image.
- await run('gradle',[
-  'assembleDebug',
-  '--no-daemon',
-  '--max-workers=1',
-  '--no-configuration-cache',
-  '-Dorg.gradle.jvmargs=-Xmx384m -XX:MaxMetaspaceSize=192m',
-  '-Dorg.gradle.internal.instrumentation.agent=false',
-  '-Pkotlin.compiler.execution.strategy=in-process'
-], root, BUILD_TIMEOUT);
+  await run('gradle', [
+    'assembleDebug',
+    '--no-daemon',
+    '--max-workers=1',
+    '--no-configuration-cache',
+    '-Dorg.gradle.jvmargs=-Xmx384m -XX:MaxMetaspaceSize=192m',
+    '-Dorg.gradle.internal.instrumentation.agent=false',
+    '-Pkotlin.compiler.execution.strategy=in-process'
+  ], root, BUILD_TIMEOUT);
 
-  const apk = await findApk(path.join(root, 'app', 'build', 'outputs', 'apk'));
+  const apk = await findApk(
+    path.join(root, 'app', 'build', 'outputs', 'apk')
+  );
+
   if (!apk) {
     throw new Error('Gradle build finished, but no debug APK was found.');
   }
@@ -351,7 +390,10 @@ async function buildWebProject(root, work) {
     await run('npm', ['install', '--no-audit', '--no-fund'], root);
     await run('npm', ['run', 'build'], root);
 
-    const candidates = ['dist', 'build', 'www'].map(n => path.join(root, n));
+    const candidates = ['dist', 'build', 'www'].map(n =>
+      path.join(root, n)
+    );
+
     webDir = null;
 
     for (const candidate of candidates) {
@@ -387,11 +429,14 @@ async function buildWebProject(root, work) {
   await fs.mkdir(native, { recursive: true });
   await fs.cp(webDir, path.join(native, 'www'), { recursive: true });
 
-  await fs.writeFile(path.join(native, 'package.json'), JSON.stringify({
-    name: 'apk-wrapper',
-    version: '1.0.0',
-    private: true
-  }, null, 2));
+  await fs.writeFile(
+    path.join(native, 'package.json'),
+    JSON.stringify({
+      name: 'apk-wrapper',
+      version: '1.0.0',
+      private: true
+    }, null, 2)
+  );
 
   await run('npm', [
     'install',
@@ -402,20 +447,32 @@ async function buildWebProject(root, work) {
     '@capacitor/android@^7'
   ], native);
 
-  await fs.writeFile(path.join(native, 'capacitor.config.json'), JSON.stringify({
-    appId,
-    appName,
-    webDir: 'www',
-    bundledWebRuntime: false
-  }, null, 2));
+  await fs.writeFile(
+    path.join(native, 'capacitor.config.json'),
+    JSON.stringify({
+      appId,
+      appName,
+      webDir: 'www',
+      bundledWebRuntime: false
+    }, null, 2)
+  );
 
   await run('npx', ['cap', 'add', 'android'], native);
   await run('npx', ['cap', 'sync', 'android'], native);
 
   const androidDir = path.join(native, 'android');
-  await run('./gradlew', ['assembleDebug', '--no-daemon'], androidDir, BUILD_TIMEOUT);
 
-  const apk = await findApk(path.join(androidDir, 'app', 'build', 'outputs', 'apk'));
+  await run(
+    './gradlew',
+    ['assembleDebug', '--no-daemon'],
+    androidDir,
+    BUILD_TIMEOUT
+  );
+
+  const apk = await findApk(
+    path.join(androidDir, 'app', 'build', 'outputs', 'apk')
+  );
+
   if (!apk) {
     throw new Error('Web build finished, but no APK was found.');
   }
@@ -453,17 +510,21 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
     jobCreated = true;
 
     const zipPath = path.join(work, 'source.zip');
+
     await fs.writeFile(zipPath, req.file.buffer, { mode: 0o600 });
 
     const extracted = path.join(work, 'extracted');
+
     await extractSafe(zipPath, extracted);
 
     const project = await findProject(extracted);
+
     if (!project) {
       throw new Error('Could not find a valid Android Gradle project or web project in this ZIP.');
     }
 
     const root = project.root;
+
     await removeEnvFiles(root);
 
     let apk;
@@ -480,35 +541,47 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
 
     const apkBuffer = await fs.readFile(apk);
 
-    await supabaseRequest(`/storage/v1/object/apk-artifacts/${objectPath}`, req.accessToken, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/vnd.android.package-archive',
-        'x-upsert': 'false'
-      },
-      body: apkBuffer
-    });
+    await supabaseRequest(
+      `/storage/v1/object/apk-artifacts/${objectPath}`,
+      req.accessToken,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/vnd.android.package-archive',
+          'x-upsert': 'false'
+        },
+        body: apkBuffer
+      }
+    );
 
-    await supabaseRequest(`/rest/v1/conversion_jobs?id=eq.${jobId}&user_id=eq.${userId}`, req.accessToken, {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal'
-      },
-      body: JSON.stringify({
-        status: 'completed',
-        artifact_path: objectPath,
-        artifact_bytes: apkBuffer.length,
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-    });
+    await supabaseRequest(
+      `/rest/v1/conversion_jobs?id=eq.${jobId}&user_id=eq.${userId}`,
+      req.accessToken,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal'
+        },
+        body: JSON.stringify({
+          status: 'completed',
+          artifact_path: objectPath,
+          artifact_bytes: apkBuffer.length,
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+      }
+    );
 
-    const signed = await supabaseRequest(`/storage/v1/object/sign/apk-artifacts/${objectPath}`, req.accessToken, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expiresIn: 3600 })
-    });
+    const signed = await supabaseRequest(
+      `/storage/v1/object/sign/apk-artifacts/${objectPath}`,
+      req.accessToken,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expiresIn: 3600 })
+      }
+    );
 
     if (!res.headersSent) {
       res.json({
@@ -523,18 +596,22 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
 
     if (jobCreated) {
       try {
-        await supabaseRequest(`/rest/v1/conversion_jobs?id=eq.${jobId}&user_id=eq.${userId}`, req.accessToken, {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            Prefer: 'return=minimal'
-          },
-          body: JSON.stringify({
-            status: 'failed',
-            error_message: err.message.slice(0, 1000),
-            updated_at: new Date().toISOString()
-          })
-        });
+        await supabaseRequest(
+          `/rest/v1/conversion_jobs?id=eq.${jobId}&user_id=eq.${userId}`,
+          req.accessToken,
+          {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal'
+            },
+            body: JSON.stringify({
+              status: 'failed',
+              error_message: err.message.slice(0, 1000),
+              updated_at: new Date().toISOString()
+            })
+          }
+        );
       } catch (dbErr) {
         console.error('Could not update failed job:', dbErr.message);
       }
@@ -565,7 +642,10 @@ app.get('/api/jobs/:id/download', requireUser, async (req, res) => {
 
     const job = rows?.[0];
 
-    if (!job) return res.status(404).json({ error: 'Conversion not found.' });
+    if (!job) {
+      return res.status(404).json({ error: 'Conversion not found.' });
+    }
+
     if (job.status !== 'completed' || !job.artifact_path) {
       return res.status(409).json({ error: 'APK is not ready yet.' });
     }
@@ -591,6 +671,7 @@ app.get('/api/jobs/:id/download', requireUser, async (req, res) => {
     });
   } catch (err) {
     console.error('Download link error:', err.message);
+
     res.status(502).json({
       error: 'Could not create the download link. Please try again.'
     });
