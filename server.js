@@ -1,8 +1,6 @@
 
 import express from 'express';
-import multer from 'multer';
 import rateLimit from 'express-rate-limit';
-import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -14,28 +12,25 @@ const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_ACTIONS_TOKEN;
 const GITHUB_REPO = 'manhalkaruthon-pixel/ai-studio-apk-converter';
-const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_BYTES || 100 * 1024 * 1024);
 
 if (!SUPABASE_URL || !SUPABASE_KEY || !GITHUB_TOKEN) {
   console.error('Missing required environment variables.');
   process.exit(1);
 }
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_UPLOAD, files: 1 },
-  fileFilter: (_req, file, cb) => {
-    const ok =
-      file.originalname.toLowerCase().endsWith('.zip') &&
-      ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'].includes(file.mimetype);
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false
+}));
 
-    cb(ok ? null : new Error('Upload a .zip archive.'), ok);
-  }
-});
+app.use(express.json({ limit: '32kb' }));
 
-function encodePath(value) {
-  return String(value).split('/').map(encodeURIComponent).join('/');
-}
+app.use(express.static(path.join(__dirname, 'public'), {
+  index: 'index.html',
+  maxAge: '1h'
+}));
 
 async function supabaseRequest(endpoint, accessToken, options = {}) {
   const response = await fetch(`${SUPABASE_URL}${endpoint}`, {
@@ -103,55 +98,51 @@ async function requireUser(req, res, next) {
   }
 }
 
-async function updateJob(jobId, userId, accessToken, values) {
-  return supabaseRequest(
-    `/rest/v1/conversion_jobs?id=eq.${encodeURIComponent(jobId)}&user_id=eq.${encodeURIComponent(userId)}`,
-    accessToken,
-    {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal'
-      },
-      body: JSON.stringify({
-        ...values,
-        updated_at: new Date().toISOString()
-      })
-    }
-  );
+function encodePath(value) {
+  return String(value).split('/').map(encodeURIComponent).join('/');
 }
-
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 30,
-  standardHeaders: 'draft-8',
-  legacyHeaders: false
-}));
-
-app.use(express.static(path.join(__dirname, 'public'), {
-  index: 'index.html',
-  maxAge: '1h'
-}));
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-// Upload ZIP, create job, and ask GitHub Actions to build the APK.
-app.post('/api/convert', requireUser, upload.single('file'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'Select a ZIP archive.' });
+// Create a job after the browser has uploaded the ZIP directly to Supabase.
+app.post('/api/convert', requireUser, async (req, res) => {
+  const { jobId, originalFilename, sourceBytes } = req.body || {};
+
+  if (
+    typeof jobId !== 'string' ||
+    !/^[0-9a-f-]{36}$/i.test(jobId) ||
+    typeof originalFilename !== 'string' ||
+    !originalFilename.toLowerCase().endsWith('.zip') ||
+    !Number.isSafeInteger(sourceBytes) ||
+    sourceBytes < 1
+  ) {
+    return res.status(400).json({ error: 'Invalid conversion details.' });
   }
 
-  const jobId = crypto.randomUUID();
   const userId = req.user.id;
-
   const sourcePath = `${userId}/${jobId}/source.zip`;
   const artifactPath = `${userId}/${jobId}/app.apk`;
 
-  let jobCreated = false;
-
   try {
+    // Verify that the ZIP was uploaded before creating the build job.
+    const fileCheck = await fetch(
+      `${SUPABASE_URL}/storage/v1/object/info/apk-artifacts/${encodePath(sourcePath)}`,
+      {
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${req.accessToken}`
+        }
+      }
+    );
+
+    if (!fileCheck.ok) {
+      return res.status(400).json({
+        error: 'The ZIP upload could not be verified. Please try uploading again.'
+      });
+    }
+
     // Create the conversion job.
     await supabaseRequest('/rest/v1/conversion_jobs', req.accessToken, {
       method: 'POST',
@@ -162,29 +153,13 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
       body: JSON.stringify({
         id: jobId,
         user_id: userId,
-        original_filename: req.file.originalname,
+        original_filename: originalFilename,
         status: 'queued',
-        source_bytes: req.file.size
+        source_bytes: sourceBytes
       })
     });
 
-    jobCreated = true;
-
-    // Upload the original ZIP to private Supabase storage.
-    await supabaseRequest(
-      `/storage/v1/object/apk-artifacts/${encodePath(sourcePath)}`,
-      req.accessToken,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/zip',
-          'x-upsert': 'false'
-        },
-        body: req.file.buffer
-      }
-    );
-
-    // Trigger the GitHub Actions workflow.
+    // Start the GitHub Actions workflow.
     const dispatch = await fetch(
       `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/android-build.yml/dispatches`,
       {
@@ -208,10 +183,26 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
 
     if (!dispatch.ok) {
       const detail = await dispatch.text();
-      throw new Error(`GitHub workflow could not be started (${dispatch.status}): ${detail.slice(0, 500)}`);
+
+      await supabaseRequest(
+        `/rest/v1/conversion_jobs?id=eq.${encodeURIComponent(jobId)}&user_id=eq.${encodeURIComponent(userId)}`,
+        req.accessToken,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal'
+          },
+          body: JSON.stringify({
+            status: 'failed',
+            error_message: `GitHub workflow could not be started (${dispatch.status}): ${detail.slice(0, 500)}`
+          })
+        }
+      );
+
+      throw new Error(`GitHub workflow could not be started (${dispatch.status}).`);
     }
 
-    // The actual build now runs on GitHub, not Railway.
     return res.status(202).json({
       jobId,
       status: 'queued',
@@ -221,20 +212,8 @@ app.post('/api/convert', requireUser, upload.single('file'), async (req, res) =>
   } catch (err) {
     console.error('Job creation failed:', err.message);
 
-    if (jobCreated) {
-      try {
-        await updateJob(jobId, userId, req.accessToken, {
-          status: 'failed',
-          error_message: err.message.slice(0, 1000)
-        });
-      } catch (dbError) {
-        console.error('Could not update failed job:', dbError.message);
-      }
-    }
-
     return res.status(502).json({
-      error: err.message.slice(0, 1000) || 'Could not start the APK build.',
-      jobId: jobCreated ? jobId : undefined
+      error: err.message || 'Could not start the APK build.'
     });
   }
 });
@@ -298,13 +277,6 @@ app.get('/api/jobs', requireUser, async (req, res) => {
     console.error('Job list error:', err.message);
     return res.status(502).json({ error: 'Could not load your conversions.' });
   }
-});
-
-app.use((err, _req, res, _next) => {
-  const status = err instanceof multer.MulterError ? 413 : 400;
-  res.status(status).json({
-    error: err.message || 'Request failed.'
-  });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
