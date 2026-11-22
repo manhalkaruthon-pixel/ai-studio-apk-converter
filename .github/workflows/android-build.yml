@@ -43,7 +43,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '9.3.1'
+          gradle-version: '8.11.1'
 
       - name: Install Android SDK
         uses: android-actions/setup-android@v4
@@ -106,13 +106,16 @@ jobs:
             echo "Native Android project detected."
             cd "$NATIVE_ROOT"
 
-            if [ ! -f gradlew ]; then
-              echo "This Android project has no Gradle wrapper."
-              exit 1
+            if [ -f gradlew ]; then
+              echo "Gradle wrapper found. Using project Gradle version."
+              chmod +x gradlew
+              ./gradlew assembleDebug --no-daemon --stacktrace
+            else
+              echo "No Gradle wrapper found. Using installed Gradle 8.11.1."
+              gradle --version
+              gradle assembleDebug --no-daemon --stacktrace
             fi
 
-            chmod +x gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace
             APK="$(find . -type f -path '*/build/outputs/apk/debug/*.apk' | head -n 1)"
           else
             echo "Looking for a web project..."
