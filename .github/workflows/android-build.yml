@@ -35,6 +35,16 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
       - name: Install Android SDK
         uses: android-actions/setup-android@v3
 
@@ -49,29 +59,142 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SOURCE_PATH: ${{ inputs.source_path }}
         run: |
-          curl -f -L \
+          set -euo pipefail
+          curl --fail-with-body -L \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             "$SUPABASE_URL/storage/v1/object/apk-artifacts/$SOURCE_PATH" \
             -o source.zip
 
-      - name: Extract project
+      - name: Extract source ZIP
         run: |
+          set -euo pipefail
           mkdir project
           unzip -q source.zip -d project
-          find project -type f -name "gradlew" -exec chmod +x {} \;
 
       - name: Build APK
         run: |
-          cd project
-          if [ -f gradlew ]; then
+          set -euo pipefail
+
+          echo "Looking for an Android or web project..."
+
+          NATIVE_ROOT=""
+
+          while IFS= read -r settings; do
+            candidate="$(dirname "$settings")"
+
+            if [ -f "$candidate/app/build.gradle" ] || [ -f "$candidate/app/build.gradle.kts" ]; then
+              NATIVE_ROOT="$candidate"
+              break
+            fi
+          done < <(find project -type f \( -name settings.gradle -o -name settings.gradle.kts \))
+
+          if [ -n "$NATIVE_ROOT" ]; then
+            echo "Native Android project detected."
+
+            cd "$NATIVE_ROOT"
+
+            if [ ! -f gradlew ]; then
+              echo "This Android project has no Gradle wrapper."
+              exit 1
+            fi
+
+            chmod +x gradlew
             ./gradlew assembleDebug --no-daemon --stacktrace
-          elif [ -f gradle/wrapper/gradle-wrapper.properties ]; then
-            gradle assembleDebug --no-daemon --stacktrace
+
+            APK="$(find . -type f -path '*/build/outputs/apk/debug/*.apk' | head -n 1)"
+
           else
-            echo "No Gradle Android project found in ZIP"
+            echo "Looking for a web project..."
+
+            WEB_ROOT=""
+
+            while IFS= read -r file; do
+              WEB_ROOT="$(dirname "$file")"
+              break
+            done < <(find project -type f \( -name package.json -o -name index.html \) \
+              -not -path '*/node_modules/*' \
+              -not -path '*/.git/*')
+
+            if [ -z "$WEB_ROOT" ]; then
+              echo "No web or Android project was found in the ZIP."
+              exit 1
+            fi
+
+            echo "Web project found at: $WEB_ROOT"
+
+            WORK="$GITHUB_WORKSPACE/capacitor-wrapper"
+            mkdir -p "$WORK"
+            cd "$WEB_ROOT"
+
+            if [ -f package.json ]; then
+              npm install --no-audit --no-fund
+
+              if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+                npm run build
+              else
+                echo "No build script found in package.json."
+                exit 1
+              fi
+
+              WEB_DIR=""
+
+              for dir in dist build www; do
+                if [ -f "$dir/index.html" ]; then
+                  WEB_DIR="$dir"
+                  break
+                fi
+              done
+
+              if [ -z "$WEB_DIR" ]; then
+                echo "No index.html found in dist, build, or www."
+                exit 1
+              fi
+
+              cp -R "$WEB_DIR/." "$WORK/" 
+            else
+              cp -R . "$WORK/"
+            fi
+
+            cd "$GITHUB_WORKSPACE"
+            mkdir -p "$WORK/www"
+            find "$WORK" -maxdepth 1 -type f -exec mv {} "$WORK/www/" \;
+            find "$WORK" -mindepth 1 -maxdepth 1 -type d ! -name www -exec mv {} "$WORK/www/" \;
+
+            cd "$WORK"
+            npm init -y
+            npm install --no-audit --no-fund @capacitor/core@^7 @capacitor/cli@^7 @capacitor/android@^7
+
+            node --input-type=module <<'NODE'
+            import fs from 'node:fs';
+
+            fs.writeFileSync(
+              'capacitor.config.json',
+              JSON.stringify({
+                appId: 'com.aistudio.converted.app',
+                appName: 'Converted App',
+                webDir: 'www'
+              }, null, 2)
+            );
+            NODE
+
+            npx cap add android
+            npx cap sync android
+
+            cd android
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon --stacktrace
+
+            APK="$(find app/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
+          fi
+
+          if [ -z "${APK:-}" ] || [ ! -f "$APK" ]; then
+            echo "APK file was not generated."
             exit 1
           fi
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$APK" "$GITHUB_WORKSPACE/output/app.apk"
 
       - name: Upload APK to Supabase
         if: success()
@@ -80,14 +203,13 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ARTIFACT_PATH: ${{ inputs.artifact_path }}
         run: |
-          APK=$(find project -type f -path "*/build/outputs/apk/debug/*.apk" | head -n 1)
-          test -n "$APK"
-          curl -f -X POST \
+          set -euo pipefail
+          curl --fail-with-body -X POST \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Type: application/vnd.android.package-archive" \
             -H "x-upsert: true" \
-            --data-binary "@$APK" \
+            --data-binary "@output/app.apk" \
             "$SUPABASE_URL/storage/v1/object/apk-artifacts/$ARTIFACT_PATH"
 
       - name: Mark job completed
@@ -97,10 +219,25 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           JOB_ID: ${{ inputs.job_id }}
         run: |
-          curl -f -X PATCH \
+          curl --fail-with-body -X PATCH \
             "$SUPABASE_URL/rest/v1/conversion_jobs?id=eq.$JOB_ID" \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
             -d '{"status":"completed"}'
+
+      - name: Mark job failed
+        if: failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          curl --silent --show-error -X PATCH \
+            "$SUPABASE_URL/rest/v1/conversion_jobs?id=eq.$JOB_ID" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d '{"status":"failed","error_message":"APK build failed. Check the GitHub Actions build log."}'
