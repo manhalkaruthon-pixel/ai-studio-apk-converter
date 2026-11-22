@@ -96,7 +96,6 @@ jobs:
 
           while IFS= read -r settings; do
             candidate="$(dirname "$settings")"
-
             if [ -f "$candidate/app/build.gradle" ] || [ -f "$candidate/app/build.gradle.kts" ]; then
               NATIVE_ROOT="$candidate"
               break
@@ -176,18 +175,7 @@ jobs:
             npm init -y
             npm install --no-audit --no-fund @capacitor/core@^7 @capacitor/cli@^7 @capacitor/android@^7
 
-            node --input-type=module <<'NODE'
-            import fs from 'node:fs';
-
-            fs.writeFileSync(
-              'capacitor.config.json',
-              JSON.stringify({
-                appId: 'com.aistudio.converted.app',
-                appName: 'Converted App',
-                webDir: 'www'
-              }, null, 2)
-            );
-            NODE
+            node --input-type=module -e 'import fs from "node:fs"; fs.writeFileSync("capacitor.config.json", JSON.stringify({appId:"com.aistudio.converted.app",appName:"Converted App",webDir:"www"},null,2));'
 
             npx cap add android
             npx cap sync android
