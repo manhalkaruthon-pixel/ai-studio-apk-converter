@@ -218,11 +218,17 @@ async function removeEnvFiles(root) {
       if (ent.isDirectory()) {
         if (['node_modules', '.git'].includes(ent.name)) continue;
         await walk(full);
-      } else if (ent.name === '.env' || ent.name.startsWith('.env.')) {
+      } else if (
+        ent.name === '.env' ||
+        (ent.name.startsWith('.env.') && ent.name !== '.env.example')
+      ) {
         await fs.rm(full, { force: true });
       }
     }
   }
+
+  await walk(root);
+}
 
   await walk(root);
 }
