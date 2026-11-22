@@ -1,0 +1,106 @@
+
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Conversion job ID
+        required: true
+        type: string
+      source_path:
+        description: Source ZIP path in Supabase
+        required: true
+        type: string
+      artifact_path:
+        description: Output APK path in Supabase
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platform-tools" "platforms;android-36" "platforms;android-36.1" "build-tools;36.0.0"
+
+      - name: Download source ZIP
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SOURCE_PATH: ${{ inputs.source_path }}
+        run: |
+          curl -f -L \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            "$SUPABASE_URL/storage/v1/object/apk-artifacts/$SOURCE_PATH" \
+            -o source.zip
+
+      - name: Extract project
+        run: |
+          mkdir project
+          unzip -q source.zip -d project
+          find project -type f -name "gradlew" -exec chmod +x {} \;
+
+      - name: Build APK
+        run: |
+          cd project
+          if [ -f gradlew ]; then
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          elif [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            gradle assembleDebug --no-daemon --stacktrace
+          else
+            echo "No Gradle Android project found in ZIP"
+            exit 1
+          fi
+
+      - name: Upload APK to Supabase
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+        run: |
+          APK=$(find project -type f -path "*/build/outputs/apk/debug/*.apk" | head -n 1)
+          test -n "$APK"
+          curl -f -X POST \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/vnd.android.package-archive" \
+            -H "x-upsert: true" \
+            --data-binary "@$APK" \
+            "$SUPABASE_URL/storage/v1/object/apk-artifacts/$ARTIFACT_PATH"
+
+      - name: Mark job completed
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          curl -f -X PATCH \
+            "$SUPABASE_URL/rest/v1/conversion_jobs?id=eq.$JOB_ID" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d '{"status":"completed"}'
